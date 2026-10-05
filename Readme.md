@@ -146,6 +146,7 @@ git clone https://github.com/Radiantech-Systems/Asrock_object-detecor.git
 
 Install Debian build dependencies:
 sudo apt update
+
 sudo apt install -y build-essential debhelper devscripts
 
 build:
