@@ -1,0 +1,44 @@
+# ==============================
+# Compiled object files
+# ==============================
+*.o
+*.obj
+
+# ==============================
+# Compiled binaries
+# ==============================
+files/src/object-detector
+files/src/video-event-generator
+files/src/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+
+# ==============================
+# Debian build artifacts
+# ==============================
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.postrm.debhelper
+debian/radian-object-detector/
+
+# ==============================
+# Debian packages
+# ==============================
+*.deb
+*.ddeb
+*.buildinfo
+*.changes
+
+# ==============================
+# Runtime/generated data
+# ==============================
+*.log
+__pycache__/
+*.pyc
+
+# ==============================
+# Runtime directories
+# ==============================
+snapshots/
+recordings/
+events/

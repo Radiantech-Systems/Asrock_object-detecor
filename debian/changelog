@@ -1,0 +1,5 @@
+radian-object-detector (1.0.0-1) jammy; urgency=medium
+
+  * Initial Ubuntu ARM64 Debian package.
+
+ -- Radian Tech <support@radian-tech.com>  Sat, 03 Oct 2026 11:00:00 +0530

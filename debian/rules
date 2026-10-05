@@ -1,0 +1,111 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cd files/src/nvdsinfer_custom_impl_Yolo && \
+	$(MAKE) \
+		CUDA_VER=12.6 \
+        CPPFLAGS= \
+		CC=g++ \
+		CXX=g++ \
+		NVCC=nvcc \
+		SYSROOT=
+
+	cd files/src && \
+	g++ \
+	-std=c++17 \
+	-Wall \
+	-Wextra \
+	-fPIC \
+	-pthread \
+	$$(pkg-config --cflags gstreamer-1.0) \
+	$$(pkg-config --cflags gstreamer-base-1.0) \
+	$$(pkg-config --cflags gstreamer-app-1.0) \
+	$$(pkg-config --cflags gstreamer-rtsp-server-1.0) \
+	$$(pkg-config --cflags opencv4) \
+	-I/opt/nvidia/deepstream/deepstream-7.1/sources/includes \
+	-I/usr/include \
+	object-detector.cpp \
+	-o object-detector \
+	$$(pkg-config --libs gstreamer-1.0) \
+	$$(pkg-config --libs gstreamer-base-1.0) \
+	$$(pkg-config --libs gstreamer-app-1.0) \
+	$$(pkg-config --libs gstreamer-rtsp-server-1.0) \
+	$$(pkg-config --libs opencv4) \
+	-L/opt/nvidia/deepstream/deepstream-7.1/lib \
+	-lnvds_meta \
+	-lnvdsgst_meta \
+	-lnvds_infer \
+	-lnvbufsurface \
+	-lnvbufsurftransform
+
+	cd files/src && \
+	g++ \
+	-std=c++17 \
+	-Wall \
+	-Wextra \
+	-pthread \
+	video_event_generator.cpp \
+	-o video-event-generator
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
+
+override_dh_auto_install:
+	install -d debian/radian-object-detector/usr/bin
+
+	install -m 0755 \
+		files/src/object-detector \
+		debian/radian-object-detector/usr/bin/object-detector
+
+	install -m 0755 \
+		files/src/video-event-generator \
+		debian/radian-object-detector/usr/bin/video-event-generator
+
+	install -m 0755 \
+		files/snapshot_server.py \
+		debian/radian-object-detector/usr/bin/snapshot_server.py
+
+	install -d debian/radian-object-detector/opt/radian/ai/lib
+	install -d debian/radian-object-detector/opt/radian/ai/model
+	install -d debian/radian-object-detector/opt/radian/ai/config
+
+	install -m 0755 \
+		files/src/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so \
+		debian/radian-object-detector/opt/radian/ai/lib/libnvdsinfer_custom_impl_Yolo.so
+
+	install -m 0644 \
+		files/model/yolo26s.onnx \
+		debian/radian-object-detector/opt/radian/ai/model/yolo26s.onnx
+
+	install -m 0644 \
+		files/model/yolo26s.onnx.data \
+		debian/radian-object-detector/opt/radian/ai/model/yolo26s.onnx.data
+
+	install -m 0644 \
+		files/model/labels.txt \
+		debian/radian-object-detector/opt/radian/ai/model/labels.txt
+
+	install -m 0644 \
+		files/config_infer_primary_yolo26.txt \
+		debian/radian-object-detector/opt/radian/ai/config/config_infer_primary_yolo26.txt
+
+	install -d debian/radian-object-detector/root/video_recorder/snapshots/people
+	install -d debian/radian-object-detector/root/video_recorder/snapshots/vehicles
+	install -d debian/radian-object-detector/root/video_recorder/snapshots/animals
+	install -d debian/radian-object-detector/root/video_recorder/snapshots/electronics
+	install -d debian/radian-object-detector/root/video_recorder/snapshots/other
+	install -d debian/radian-object-detector/root/video_recorder/events/pending
+	install -d debian/radian-object-detector/root/video_recorder/events/videos
+
+	install -d debian/radian-object-detector/lib/systemd/system
+
+	install -m 0644 \
+		files/service/object-detector.service \
+		debian/radian-object-detector/lib/systemd/system/object-detector.service
+
+	install -m 0644 \
+		files/service/snapshot-server.service \
+		debian/radian-object-detector/lib/systemd/system/snapshot-server.service

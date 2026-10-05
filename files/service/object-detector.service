@@ -1,0 +1,18 @@
+[Unit]
+Description=Radian YOLO26 Object Detection and Video Event System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+ExecStart=/bin/sh -c '/usr/bin/video-event-generator & exec /usr/bin/object-detector "rtsp://admin:Radian-123@192.168.1.250:554/video/live?channel=1&subtype=0"'
+
+Restart=always
+RestartSec=5
+
+Environment="GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0/deepstream"
+Environment="LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local/cuda-12.6/lib:/usr/local/cuda-12.6/lib64:/usr/lib"
+
+[Install]
+WantedBy=multi-user.target

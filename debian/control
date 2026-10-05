@@ -1,0 +1,37 @@
+Source: radian-object-detector
+Section: video
+Priority: optional
+Maintainer: Radian Tech <support@radian-tech.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ g++,
+ pkg-config,
+ nlohmann-json3-dev,
+ libopencv-dev,
+ libgstreamer1.0-dev,
+ libgstreamer-plugins-base1.0-dev,
+ libgstrtspserver-1.0-dev,
+ deepstream-7.1,
+ libnvinfer-dev,
+ libnvinfer-plugin-dev,
+ libnvonnxparsers-dev
+Standards-Version: 4.6.0
+Rules-Requires-Root: no
+
+Package: radian-object-detector
+Architecture: arm64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ ffmpeg,
+ python3,
+ python3-flask,
+ python3-werkzeug,
+ deepstream-7.1,
+ libnvinfer10,
+ libnvinfer-plugin10,
+ libnvonnxparsers10,
+ cuda-cudart-12-6
+Description: Radian YOLO26 DeepStream object detector
+ YOLO26 DeepStream object detection with timestamped JPEG snapshots,
+ annotated live stream, event video generation and Flask snapshot server.
