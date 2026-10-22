@@ -27,6 +27,7 @@ override_dh_auto_build:
 	$$(pkg-config --cflags opencv4) \
 	-I/opt/nvidia/deepstream/deepstream-7.1/sources/includes \
 	-I/usr/include \
+        -I/usr/local/cuda-12.6/targets/aarch64-linux/include \
 	object-detector.cpp \
 	-o object-detector \
 	$$(pkg-config --libs gstreamer-1.0) \
@@ -35,9 +36,13 @@ override_dh_auto_build:
 	$$(pkg-config --libs gstreamer-rtsp-server-1.0) \
 	$$(pkg-config --libs opencv4) \
 	-L/opt/nvidia/deepstream/deepstream-7.1/lib \
+	-L/usr/local/cuda-12.6/targets/aarch64-linux/lib \
+        -lcudart \
+	-lnvinfer \
 	-lnvds_meta \
 	-lnvdsgst_meta \
 	-lnvds_infer \
+	-lnvds_batch_jpegenc \
 	-lnvbufsurface \
 	-lnvbufsurftransform
 
@@ -89,13 +94,15 @@ override_dh_auto_install:
 		debian/radian-object-detector/opt/radian/ai/model/labels.txt
 
 	install -m 0644 \
+		files/model/best.engine \
+		debian/radian-object-detector/opt/radian/ai/model/best.engine
+
+
+	install -m 0644 \
 		files/config_infer_primary_yolo26.txt \
 		debian/radian-object-detector/opt/radian/ai/config/config_infer_primary_yolo26.txt
 
 	install -d debian/radian-object-detector/root/video_recorder/snapshots/people
-	install -d debian/radian-object-detector/root/video_recorder/snapshots/vehicles
-	install -d debian/radian-object-detector/root/video_recorder/snapshots/animals
-	install -d debian/radian-object-detector/root/video_recorder/snapshots/electronics
 	install -d debian/radian-object-detector/root/video_recorder/snapshots/other
 	install -d debian/radian-object-detector/root/video_recorder/events/pending
 	install -d debian/radian-object-detector/root/video_recorder/events/videos

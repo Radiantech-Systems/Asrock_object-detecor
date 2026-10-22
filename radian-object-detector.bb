@@ -14,6 +14,8 @@ SRC_URI = " \
     file://model/yolo26s.onnx \
     file://model/yolo26s.onnx.data \
     file://model/labels.txt \
+    file://model/best.engine \
+    file://model/plate.engine \
     file://config_infer_primary_yolo26.txt \
     file://src/nvdsinfer_custom_impl_Yolo/ \
     file://src/object-detector.cpp \
@@ -256,9 +258,18 @@ do_install() {
         ${WORKDIR}/model/labels.txt \
         ${D}/opt/radian/ai/model/labels.txt
 
+    install -m 0644 \
+        ${WORKDIR}/model/best.engine \
+        ${D}/opt/radian/ai/model/best.engine
+
+    install -m 0644 \
+        ${WORKDIR}/model/plate.engine \
+        ${D}/opt/radian/ai/model/plate.engine
+
 
     # ========================================================
     # DeepStream configuration
+    # ========================================================
     # ========================================================
 
     install -d ${D}/opt/radian/ai/config
@@ -331,6 +342,8 @@ FILES:${PN} += " \
     /opt/radian/ai/model/yolo26s.onnx \
     /opt/radian/ai/model/yolo26s.onnx.data \
     /opt/radian/ai/model/labels.txt \
+    /opt/radian/ai/model/best.engine \
+    /opt/radian/ai/model/plate.engine \
     /opt/radian/ai/config \
     /opt/radian/ai/config/config_infer_primary_yolo26.txt \
     /root/video_recorder \
