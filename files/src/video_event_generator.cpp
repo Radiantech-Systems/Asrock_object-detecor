@@ -31,22 +31,21 @@ static const std::string RECORDINGS_ROOT =
 static const std::string OUTPUT_DIR =
     "/root/video_recorder/events/videos";
 
-static const int BEFORE_SECONDS = 60;
-static const int AFTER_SECONDS  = 60;
+static const int BEFORE_SECONDS = 30;
+static const int AFTER_SECONDS  = 30;
 
-static const int TARGET_EVENT_SECONDS = 120;
+static const int TARGET_EVENT_SECONDS = 60;
 
 /*
  * Minimum usable footage required to generate an event.
  *
- * 120 sec = perfect
- * 119 sec = generate
- * 117 sec = generate
- * 115 sec = generate
- * 110 sec = generate + warning
- * <110 sec = reject
+ * 60 sec = perfect
+ * 59 sec = generate
+ * 57 sec = generate
+ * 55 sec = generate + warning
+ * <55 sec = reject
  */
-static const int MIN_EVENT_SECONDS = 110;
+static const int MIN_EVENT_SECONDS = 55;
 
 /*
  * Small gaps between recording files are accepted.
@@ -156,40 +155,38 @@ parse_event_timestamp(
 {
     std::tm tm_value{};
 
-    if (timestamp.size() != 19)
-    {
+    // Accept both ISO format YYYY-MM-DDTHH:MM:SS and compact
+    // format YYYYMMDD_HHMMSS used by the event JSON files.
+    bool iso = timestamp.size() == 19 &&
+               timestamp[4] == '-' && timestamp[7] == '-' &&
+               timestamp[10] == 'T' && timestamp[13] == ':' &&
+               timestamp[16] == ':';
+    bool compact = timestamp.size() == 15 &&
+                   timestamp[8] == '_' &&
+                   timestamp.find_first_not_of("0123456789_") == std::string::npos;
+    if (!iso && !compact)
         return false;
-    }
-
-    if (timestamp[4] != '-' ||
-        timestamp[7] != '-' ||
-        timestamp[10] != 'T' ||
-        timestamp[13] != ':' ||
-        timestamp[16] != ':')
-    {
-        return false;
-    }
 
     try
     {
-        tm_value.tm_year =
-            std::stoi(timestamp.substr(0, 4)) - 1900;
-
-        tm_value.tm_mon =
-            std::stoi(timestamp.substr(5, 2)) - 1;
-
-        tm_value.tm_mday =
-            std::stoi(timestamp.substr(8, 2));
-
-        tm_value.tm_hour =
-            std::stoi(timestamp.substr(11, 2));
-
-        tm_value.tm_min =
-            std::stoi(timestamp.substr(14, 2));
-
-        tm_value.tm_sec =
-            std::stoi(timestamp.substr(17, 2));
-
+        if (iso)
+        {
+            tm_value.tm_year = std::stoi(timestamp.substr(0, 4)) - 1900;
+            tm_value.tm_mon  = std::stoi(timestamp.substr(5, 2)) - 1;
+            tm_value.tm_mday = std::stoi(timestamp.substr(8, 2));
+            tm_value.tm_hour = std::stoi(timestamp.substr(11, 2));
+            tm_value.tm_min  = std::stoi(timestamp.substr(14, 2));
+            tm_value.tm_sec  = std::stoi(timestamp.substr(17, 2));
+        }
+        else
+        {
+            tm_value.tm_year = std::stoi(timestamp.substr(0, 4)) - 1900;
+            tm_value.tm_mon  = std::stoi(timestamp.substr(4, 2)) - 1;
+            tm_value.tm_mday = std::stoi(timestamp.substr(6, 2));
+            tm_value.tm_hour = std::stoi(timestamp.substr(9, 2));
+            tm_value.tm_min  = std::stoi(timestamp.substr(11, 2));
+            tm_value.tm_sec  = std::stoi(timestamp.substr(13, 2));
+        }
         tm_value.tm_isdst = 0;
     }
     catch (...)
@@ -198,7 +195,6 @@ parse_event_timestamp(
     }
 
     result = make_time_utc(tm_value);
-
     return true;
 }
 
@@ -331,7 +327,11 @@ static bool
 read_detection_json(
     const std::string &json_path,
     std::string &object_name,
-    std::string &timestamp)
+    std::string &timestamp,
+    std::string &unix_timestamp,
+    std::string &violation_type,
+    std::string &camera_id,
+    std::string &snapshot)
 {
     std::ifstream file(json_path);
 
@@ -364,18 +364,29 @@ read_detection_json(
         return false;
     }
 
-    if (!get_json_string(
-            json,
-            "timestamp",
-            timestamp))
-    {
-        std::cerr
-            << "ERROR: timestamp field not found"
-            << std::endl;
+    // timestamp is required as a fallback; unix_timestamp is preferred
+    // because it avoids timezone/format ambiguity.
+    get_json_string(json, "timestamp", timestamp);
+    get_json_string(json, "unix_timestamp", unix_timestamp);
+    get_json_string(json, "violation_type", violation_type);
+    get_json_string(json, "camera_id", camera_id);
+    get_json_string(json, "snapshot", snapshot);
 
-        return false;
+    // Numeric JSON fields (such as unix_timestamp) are not quoted, so
+    // read them with a separate numeric-field expression if needed.
+    if (unix_timestamp.empty())
+    {
+        std::regex unix_re(R"("unix_timestamp"\s*:\s*([0-9]+))");
+        std::smatch unix_match;
+        if (std::regex_search(json, unix_match, unix_re))
+            unix_timestamp = unix_match[1].str();
     }
 
+    if (timestamp.empty() && unix_timestamp.empty())
+    {
+        std::cerr << "ERROR: neither timestamp nor unix_timestamp found" << std::endl;
+        return false;
+    }
     return true;
 }
 
@@ -1075,12 +1086,36 @@ get_video_duration(
  * ============================================================
  */
 
+static std::string classify_event_folder(const std::string &violation_type,
+                                          const std::string &snapshot)
+{
+    std::string combined = violation_type + " " + snapshot;
+    std::transform(combined.begin(), combined.end(), combined.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    // The snapshot path takes priority for No-Helmet, because some event
+    // JSON producers may leave violation_type set to a generic/old value.
+    if (snapshot.find("no-helmet") != std::string::npos ||
+        snapshot.find("no_helmet") != std::string::npos ||
+        snapshot.find("nohelmet") != std::string::npos)
+        return "No-Helmet";
+
+    if (violation_type.find("red_light_violation") != std::string::npos ||
+        snapshot.find("signal-jump") != std::string::npos ||
+        snapshot.find("signal_jump") != std::string::npos ||
+        snapshot.find("signal-jumpig") != std::string::npos)
+        return "Signal-Jumping";
+
+    return "";
+}
+
 static bool process_event(const std::string &json_path)
 {
-    std::string object_name;
-    std::string timestamp;
+    std::string object_name, timestamp, unix_timestamp;
+    std::string violation_type, camera_id, snapshot;
 
-    if (!read_detection_json(json_path, object_name, timestamp))
+    if (!read_detection_json(json_path, object_name, timestamp, unix_timestamp,
+                             violation_type, camera_id, snapshot))
     {
         std::cerr << "ERROR: Cannot read detection JSON: " << json_path << std::endl;
         return false;
@@ -1091,11 +1126,36 @@ static bool process_event(const std::string &json_path)
     std::cout << "JSON: " << json_path << std::endl;
     std::cout << "Object: " << object_name << std::endl;
     std::cout << "Timestamp: " << timestamp << std::endl;
+    std::cout << "Violation type: " << violation_type << std::endl;
+    std::cout << "Camera ID: " << camera_id << std::endl;
+    std::cout << "Snapshot: " << snapshot << std::endl;
 
-    std::time_t detection_time;
-    if (!parse_event_timestamp(timestamp, detection_time))
+    std::string category = classify_event_folder(violation_type, snapshot);
+    if (category.empty())
     {
-        std::cerr << "ERROR: Invalid timestamp: " << timestamp << std::endl;
+        std::cerr << "ERROR: Cannot classify event. Expected red_light_violation or No-Helmet snapshot path." << std::endl;
+        // Permanently skip unsupported event types instead of retrying every 2 seconds.
+        return true;
+    }
+
+    std::time_t detection_time = 0;
+    bool parsed = false;
+    if (!unix_timestamp.empty())
+    {
+        try
+        {
+            detection_time = static_cast<std::time_t>(std::stoll(unix_timestamp));
+            parsed = detection_time > 0;
+        }
+        catch (...) { parsed = false; }
+    }
+    if (!parsed && !timestamp.empty())
+        parsed = parse_event_timestamp(timestamp, detection_time);
+
+    if (!parsed)
+    {
+        std::cerr << "ERROR: Invalid timestamp/unix_timestamp: " << timestamp
+                  << " / " << unix_timestamp << std::endl;
         return false;
     }
 
@@ -1110,18 +1170,21 @@ static bool process_event(const std::string &json_path)
     std::cout << "  Minimum:   " << MIN_EVENT_SECONDS << " seconds" << std::endl;
 
     std::error_code ec;
-    fs::create_directories(OUTPUT_DIR, ec);
+    const std::string category_dir = OUTPUT_DIR + "/" + category;
+    fs::create_directories(category_dir, ec);
     if (ec)
     {
-        std::cerr << "ERROR: Cannot create output directory: " << OUTPUT_DIR << std::endl;
+        std::cerr << "ERROR: Cannot create category directory: " << category_dir << std::endl;
         return false;
     }
 
-    std::string output_filename =
-        safe_filename(object_name) + "_" +
-        format_filename_timestamp(detection_time) + ".mp4";
+    std::string output_filename;
+    if (!camera_id.empty())
+        output_filename += safe_filename(camera_id) + "_";
+    output_filename += safe_filename(object_name) + "_" +
+                       format_filename_timestamp(detection_time) + ".mp4";
 
-    std::string output_path = OUTPUT_DIR + "/" + output_filename;
+    std::string output_path = category_dir + "/" + output_filename;
 
     // Persistent duplicate protection. If the event video already exists,
     // this JSON has already been successfully processed.
@@ -1350,7 +1413,7 @@ int main()
 
     std::cout
         << "============================================================\n"
-        << " Radian Automatic 2-Minute Event Video Generator\n"
+        << " Radian Automatic 1-Minute Event Video Generator\n"
         << "============================================================\n"
         << "Pending directory: " << PENDING_DIR << "\n"
         << "Output directory:  " << OUTPUT_DIR << "\n"
@@ -1432,3 +1495,4 @@ int main()
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
+

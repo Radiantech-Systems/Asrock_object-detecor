@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 from flask import Flask, jsonify, send_from_directory
@@ -15,11 +14,9 @@ PORT = 5000
 BASE_DIR = "/root/video_recorder/snapshots"
 
 SNAPSHOT_DIRS = {
-    "people": os.path.join(BASE_DIR, "people"),
-    "vehicles": os.path.join(BASE_DIR, "vehicles"),
-    "animals": os.path.join(BASE_DIR, "animals"),
-    "electronics": os.path.join(BASE_DIR, "electronics"),
-    "other": os.path.join(BASE_DIR, "other"),
+    "NoHelmet": os.path.join(BASE_DIR, "NoHelmet"),
+    "wrong-rute": os.path.join(BASE_DIR, "vehicles", "wrong-rute"),
+    "signal-jumpig": os.path.join(BASE_DIR, "vehicles", "signal-jumpig"),
 }
 
 ALLOWED_EXTENSIONS = (
@@ -38,6 +35,7 @@ MAX_IMAGES_PER_CATEGORY = 100
 # ============================================================
 
 app = Flask(__name__)
+
 
 @app.after_request
 def add_cors_headers(response):
@@ -125,77 +123,49 @@ def get_all_snapshots():
 
     Dashboard categories:
 
-        People
-        Vehicles
-        Others
-
-    Others contains:
-
-        animals
-        electronics
-        other
+        NoHelmet
+        wrong-rute
+        signal-jumpig
     """
 
     result = {
-        "people": [],
-        "vehicles": [],
-        "others": []
+        "NoHelmet": [],
+        "wrong-rute": [],
+        "signal-jumpig": []
     }
 
     # --------------------------------------------------------
-    # PEOPLE
+    # NO HELMET
     # --------------------------------------------------------
 
-    people = get_images(
-        "people",
-        SNAPSHOT_DIRS["people"]
+    no_helmet = get_images(
+        "NoHelmet",
+        SNAPSHOT_DIRS["NoHelmet"]
     )
 
-    result["people"].extend(people)
+    result["NoHelmet"].extend(no_helmet)
 
     # --------------------------------------------------------
-    # VEHICLES
+    # WRONG ROUTE
     # --------------------------------------------------------
 
-    vehicles = get_images(
-        "vehicles",
-        SNAPSHOT_DIRS["vehicles"]
+    wrong_route = get_images(
+        "wrong-rute",
+        SNAPSHOT_DIRS["wrong-rute"]
     )
 
-    result["vehicles"].extend(vehicles)
+    result["wrong-rute"].extend(wrong_route)
 
     # --------------------------------------------------------
-    # OTHERS
-    #
-    # Animals + Electronics + Other
+    # SIGNAL JUMPING
     # --------------------------------------------------------
 
-    for category in (
-        "animals",
-        "electronics",
-        "other"
-    ):
-
-        images = get_images(
-            category,
-            SNAPSHOT_DIRS[category]
-        )
-
-        result["others"].extend(images)
-
-    # --------------------------------------------------------
-    # Sort combined Others category
-    # --------------------------------------------------------
-
-    result["others"].sort(
-        key=lambda item: item["timestamp"],
-        reverse=True
+    signal_jumping = get_images(
+        "signal-jumpig",
+        SNAPSHOT_DIRS["signal-jumpig"]
     )
 
-    if MAX_IMAGES_PER_CATEGORY is not None:
-        result["others"] = result["others"][
-            :MAX_IMAGES_PER_CATEGORY
-        ]
+    result["signal-jumpig"].extend(signal_jumping)
 
     return result
 
@@ -247,9 +217,9 @@ def snapshots():
     """
     Return all snapshots grouped into:
 
-        people
-        vehicles
-        others
+        NoHelmet
+        wrong-rute
+        signal-jumpig
     """
 
     result = get_all_snapshots()
@@ -270,13 +240,13 @@ def snapshot_counts():
     data = get_all_snapshots()
 
     return jsonify({
-        "people": len(data["people"]),
-        "vehicles": len(data["vehicles"]),
-        "others": len(data["others"]),
+        "NoHelmet": len(data["NoHelmet"]),
+        "wrong-rute": len(data["wrong-rute"]),
+        "signal-jumpig": len(data["signal-jumpig"]),
         "total": (
-            len(data["people"]) +
-            len(data["vehicles"]) +
-            len(data["others"])
+            len(data["NoHelmet"]) +
+            len(data["wrong-rute"]) +
+            len(data["signal-jumpig"])
         )
     })
 
@@ -291,18 +261,6 @@ def snapshot_counts():
 def serve_snapshot(category, filename):
     """
     Serve an individual snapshot image.
-
-    Example:
-
-        /snapshots/people/person.jpg
-
-        /snapshots/vehicles/car.jpg
-
-        /snapshots/animals/dog.jpg
-
-        /snapshots/electronics/tv.jpg
-
-        /snapshots/other/object.jpg
     """
 
     if category not in SNAPSHOT_DIRS:
@@ -327,76 +285,48 @@ def serve_snapshot(category, filename):
 # Category-specific APIs
 # ============================================================
 
-@app.route("/api/snapshots/people")
-def people_snapshots():
+@app.route("/api/snapshots/NoHelmet")
+def no_helmet_snapshots():
     """
-    Return only People snapshots.
+    Return only NoHelmet snapshots.
     """
 
     return jsonify({
-        "category": "people",
+        "category": "NoHelmet",
         "snapshots": get_images(
-            "people",
-            SNAPSHOT_DIRS["people"]
+            "NoHelmet",
+            SNAPSHOT_DIRS["NoHelmet"]
         )
     })
 
 
-@app.route("/api/snapshots/vehicles")
-def vehicle_snapshots():
+@app.route("/api/snapshots/wrong-rute")
+def wrong_route_snapshots():
     """
-    Return only Vehicle snapshots.
+    Return only wrong-rute snapshots.
     """
 
     return jsonify({
-        "category": "vehicles",
+        "category": "wrong-rute",
         "snapshots": get_images(
-            "vehicles",
-            SNAPSHOT_DIRS["vehicles"]
+            "wrong-rute",
+            SNAPSHOT_DIRS["wrong-rute"]
         )
     })
 
 
-@app.route("/api/snapshots/others")
-def others_snapshots():
+@app.route("/api/snapshots/signal-jumpig")
+def signal_jumping_snapshots():
     """
-    Return:
-
-        Animals
-        Electronics
-        Other
-
-    under the single Others category.
+    Return only signal-jumpig snapshots.
     """
-
-    images = []
-
-    for category in (
-        "animals",
-        "electronics",
-        "other"
-    ):
-
-        images.extend(
-            get_images(
-                category,
-                SNAPSHOT_DIRS[category]
-            )
-        )
-
-    images.sort(
-        key=lambda item: item["timestamp"],
-        reverse=True
-    )
-
-    if MAX_IMAGES_PER_CATEGORY is not None:
-        images = images[
-            :MAX_IMAGES_PER_CATEGORY
-        ]
 
     return jsonify({
-        "category": "others",
-        "snapshots": images
+        "category": "signal-jumpig",
+        "snapshots": get_images(
+            "signal-jumpig",
+            SNAPSHOT_DIRS["signal-jumpig"]
+        )
     })
 
 
@@ -464,4 +394,3 @@ if __name__ == "__main__":
         debug=False,
         threaded=True
     )
-

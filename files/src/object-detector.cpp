@@ -7,9 +7,13 @@
  *   - File 1: snapshot capture + JSON detection events
  *   - File 2: live annotated RTSP re-stream
  *
- * RTSP INPUT:
- *   Read automatically from:
+ * RTSP INPUTS:
+ *   Up to four online, valid RTSP URLs are read from:
  *   /var/lib/camera-discovery/cameras.json
+ *   All inputs share one nvstreammux/nvinfer/nvtracker chain. Batch size 1
+ *   preserves compatibility with the existing batch-1 engine; frames from
+ *   the four sources are inferred sequentially. nvstreamdemux routes each
+ *   camera to a dedicated RTSP output port/mount.
  *
  * SNAPSHOTS:
  *   Red-light snapshots retain the existing line-crossing behavior.
@@ -27,12 +31,10 @@
  *
  * Pipeline:
  *
- *   nvurisrcbin -> streammux -> nvinfer -> nvtracker -> nvdsosd -> tee
- *        |                                             |-- queue -> fakesink
- *        |                                             |-- queue -> nvvideoconvert ->
- *        |                                             |            capsfilter -> nvjpegenc ->
- *        |                                             |            appsink
- *        |                                             |-- queue -> nvrtspoutsinkbin
+ *   up to 4 x nvurisrcbin -> nvstreammux -> nvinfer -> nvtracker -> nvdsosd -> tee
+ *                                                                    |-- queue -> fakesink
+ *                                                                    |-- queue -> nvvideoconvert -> capsfilter -> nvjpegenc -> appsink
+ *                                                                    |-- nvstreamdemux -> per-camera queue -> nvrtspoutsinkbin
  *
  * ============================================================
  */
@@ -125,7 +127,11 @@ using json = nlohmann::json;
 #define WRONG_ROUTE_MIN_FLOW_STRENGTH    0.25f
 #define WRONG_ROUTE_OPPOSITE_DOT         -0.70f
 #define WRONG_ROUTE_MAX_MOTION_AGE       12
-#define RTSP_OUTPUT_URL_HINT      "rtsp://192.168.1.155:8554/ai"
+#define RTSP_OUTPUT_HOST_HINT     "192.168.1.155"
+#define RTSP_OUTPUT_BASE_PORT     8554
+#define MAX_RTSP_CAMERAS          4
+/* Preserve compatibility with the existing batch-1 YOLO26 TensorRT engine. */
+#define INFER_BATCH_SIZE           1
 
 /* Camera discovery output */
 #define CAMERA_JSON_FILE          "/var/lib/camera-discovery/cameras.json"
@@ -172,6 +178,7 @@ struct TrackState
 {
     float last_y = 0.0f;       /* bottom edge of the bbox in previous frame */
     int last_frame = 0;
+    guint source_id = 0;
 
     int side = 0;              /* confirmed side: -1 above, +1 below, 0 unknown */
     int cand_side = 0;         /* side being confirmed                          */
@@ -210,13 +217,21 @@ static std::unordered_map<guint64, TrackState> track_states;
 static std::unordered_map<guint64, guint32> id_generation;
 static std::set<CaptureKey> captured_keys;  /* red-light/line-crossing captures */
 static std::set<CaptureKey> wrong_route_captured_keys;
-static guint64 tracker_epoch = 0;
-static int last_seen_frame_num = -1;
-static guint64 last_seen_pts = 0;
+static std::unordered_map<guint, guint64> tracker_epochs;
+static std::unordered_map<guint, int> last_seen_frame_nums;
+static std::unordered_map<guint, guint64> last_seen_pts_by_source;
+static std::unordered_map<guint, int> source_link_seen_by_source;
 
-/* bumped from on_pad_added every time the camera source is (re)linked */
-static gint source_link_count = 0;
-static gint source_link_seen = 0;
+struct SourceContext
+{
+    GstElement *streammux = nullptr;
+    guint source_id = 0;
+    gint link_count = 0;
+    std::string camera_id;
+    std::string rtsp_url;
+};
+static std::vector<SourceContext> source_contexts;
+static std::vector<std::string> source_camera_ids;
 
 /* DeepStream object crop/encode context (created in main) */
 static NvDsObjEncCtxHandle obj_enc_ctx = nullptr;
@@ -528,6 +543,72 @@ static std::string get_rtsp_url_from_json()
 }
 
 
+struct CameraInput
+{
+    std::string id;
+    std::string ip;
+    std::string url;
+};
+
+static std::vector<CameraInput> get_rtsp_inputs_from_json()
+{
+    std::vector<CameraInput> result;
+    std::ifstream file(CAMERA_JSON_FILE);
+    if (!file.is_open())
+    {
+        std::cerr << "ERROR: Cannot open camera JSON file: " << CAMERA_JSON_FILE << std::endl;
+        return result;
+    }
+    try
+    {
+        json data;
+        file >> data;
+        if (!data.contains("cameras") || !data["cameras"].is_array())
+        {
+            std::cerr << "ERROR: Invalid camera JSON: 'cameras' array not found." << std::endl;
+            return result;
+        }
+        for (const auto &camera : data["cameras"])
+        {
+            if (!camera.is_object() || !camera.contains("status") ||
+                !camera["status"].is_string() || camera["status"] != "online")
+                continue;
+            if (!camera.contains("rtsp") || !camera["rtsp"].is_object()) continue;
+            const auto &rtsp = camera["rtsp"];
+            if (!rtsp.contains("valid") || !rtsp["valid"].is_boolean() ||
+                !rtsp["valid"].get<bool>()) continue;
+            if (!rtsp.contains("url") || !rtsp["url"].is_string()) continue;
+            CameraInput input;
+            input.id = camera.value("id", std::string("camera_") + std::to_string(result.size()+1));
+            input.ip = camera.value("ip", std::string("unknown"));
+            input.url = rtsp["url"].get<std::string>();
+            if (input.url.empty()) continue;
+            result.push_back(input);
+            if (result.size() >= MAX_RTSP_CAMERAS) break;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "ERROR: Failed to parse " << CAMERA_JSON_FILE << ": " << e.what() << std::endl;
+        result.clear();
+    }
+    for (size_t i = 0; i < result.size(); ++i)
+        std::cout << "[CAMERA " << i << "] id=" << result[i].id << " ip="
+                  << result[i].ip << " RTSP=" << result[i].url << std::endl;
+    return result;
+}
+
+static guint64 make_track_state_key(guint source_id, guint64 track_id)
+{
+    return (static_cast<guint64>(source_id) << 56) | (track_id & 0x00ffffffffffffffULL);
+}
+
+static std::string camera_id_for_source(guint source_id)
+{
+    if (source_id < source_camera_ids.size()) return source_camera_ids[source_id];
+    return "camera_" + std::to_string(source_id + 1);
+}
+
 /*
  * ============================================================
  * Small helpers
@@ -654,16 +735,22 @@ static std::string next_signal_jump_snapshot_path(const std::string &dir)
     return std::string();
 }
 
+/*
+ * Wrong-route snapshot names follow the same sequence as signal jumping:
+ *   NUMBERPLATE-WRONG-ROUTE.jpg
+ *   NUMBERPLATE2-WRONG-ROUTE.jpg
+ *   NUMBERPLATE3-WRONG-ROUTE.jpg
+ */
 static std::string next_wrong_route_snapshot_path(const std::string &dir)
 {
-    const std::string first = dir + "/WRONG-ROUTE.jpg";
+    const std::string first = dir + "/NUMBERPLATE-WRONG-ROUTE.jpg";
     if (!g_file_test(first.c_str(), G_FILE_TEST_EXISTS))
         return first;
 
     for (unsigned int number = 2; number < 1000000; ++number)
     {
-        const std::string path = dir + "/WRONG-ROUTE-" +
-            std::to_string(number) + ".jpg";
+        const std::string path = dir + "/NUMBERPLATE" +
+            std::to_string(number) + "-WRONG-ROUTE.jpg";
         if (!g_file_test(path.c_str(), G_FILE_TEST_EXISTS))
             return path;
     }
@@ -825,11 +912,13 @@ static bool save_detection_event(
     guint64 epoch,
     guint32 gen,
     const std::string &snapshot_path,
-    const std::string &violation_type)
+    const std::string &violation_type,
+    const std::string &camera_id)
 {
     const std::string filename = unique_path(
         EVENT_DIR,
         safe_filename_component(violation_type) + "_" +
+            safe_filename_component(camera_id) + "_" +
             safe_filename_component(object_name) + "_" +
             track_tag(track_id, epoch, gen) + "_" + timestamp,
         ".json");
@@ -866,6 +955,10 @@ static bool save_detection_event(
 
          << "  \"violation_type\": \""
          << json_escape(violation_type)
+         << "\",\n"
+
+         << "  \"camera_id\": \""
+         << json_escape(camera_id)
          << "\",\n"
 
          << "  \"snapshot\": \""
@@ -920,6 +1013,9 @@ struct SaveJob
     std::string object_name;
     float confidence = 0.0f;
     guint64 track_id = 0;
+    guint64 state_key = 0;
+    guint source_id = 0;
+    std::string camera_id;
     guint64 epoch = 0;
     guint32 gen = 0;
     CaptureKey key;
@@ -936,6 +1032,8 @@ struct SaveResult
 {
     CaptureKey key;
     guint64 track_id = 0;
+    guint64 state_key = 0;
+    guint source_id = 0;
     std::string violation_type = "red_light_violation";
     bool success = false;
     bool encoder_related = false;   /* encoder / jpg problem, not "crop too small" */
@@ -1024,7 +1122,8 @@ static gpointer save_worker_thread(gpointer data)
                 job->epoch,
                 job->gen,
                 job->jpg_path,
-                job->violation_type))
+                job->violation_type,
+                job->camera_id))
         {
             break;
         }
@@ -1052,6 +1151,8 @@ static gpointer save_worker_thread(gpointer data)
         SaveResult r;
         r.key = job->key;
         r.track_id = job->track_id;
+        r.state_key = job->state_key;
+        r.source_id = job->source_id;
         r.violation_type = job->violation_type;
         r.success = ok;
         r.encoder_related = encoder_related;
@@ -1081,6 +1182,7 @@ static bool start_vehicle_crop(
     const std::string &object_name,
     float confidence,
     guint64 track_id,
+    guint64 state_key,
     guint64 epoch,
     guint32 gen,
     const CaptureKey &key,
@@ -1127,6 +1229,13 @@ static bool start_vehicle_crop(
             static_cast<float>(surface->surfaceList[frame_meta->batch_id].width);
         const float surf_h =
             static_cast<float>(surface->surfaceList[frame_meta->batch_id].height);
+
+        g_print(
+            "[SNAPSHOT-DEBUG] source_id=%u "
+            "surface=%.0fx%.0f\n",
+            frame_meta->source_id,
+            surf_w,
+            surf_h);
 
         const float pipe_w = (frame_meta->pipeline_width > 0)
             ? static_cast<float>(frame_meta->pipeline_width) : surf_w;
@@ -1209,9 +1318,18 @@ static bool start_vehicle_crop(
         const std::time_t now = std::time(nullptr);
         const std::string timestamp = get_timestamp();
 
+        const std::string camera_id = camera_id_for_source(frame_meta->source_id);
+        /* Keep all cameras' snapshots grouped by violation type. */
+        const std::string category_dir = std::string(VEHICLE_SNAPSHOT_DIR) +
+            ((violation_type == "wrong_route") ? "/wrong-rute" : "/signal-jumpig");
+        if (g_mkdir_with_parents(category_dir.c_str(), 0755) != 0)
+        {
+            g_printerr("Failed to create violation snapshot directory: %s\n", category_dir.c_str());
+            break;
+        }
         jpg_path = (violation_type == "wrong_route")
-            ? next_wrong_route_snapshot_path(VEHICLE_SNAPSHOT_DIR)
-            : next_signal_jump_snapshot_path(VEHICLE_SNAPSHOT_DIR);
+            ? next_wrong_route_snapshot_path(category_dir)
+            : next_signal_jump_snapshot_path(category_dir);
         if (jpg_path.empty())
         {
             g_printerr("Failed to allocate a %s snapshot filename\n",
@@ -1260,6 +1378,9 @@ static bool start_vehicle_crop(
         job->object_name = object_name;
         job->confidence = confidence;
         job->track_id = track_id;
+        job->state_key = state_key;
+        job->source_id = frame_meta->source_id;
+        job->camera_id = camera_id_for_source(frame_meta->source_id);
         job->epoch = epoch;
         job->gen = gen;
         job->key = key;
@@ -1402,7 +1523,7 @@ static int consecutive_encoder_failures = 0;
 /* Estimate the dominant live traffic direction from recent tracked motion.
  * Direction is learned from the scene; no fixed left/right/up/down direction
  * or lane coordinates are configured. A weak/ambiguous flow returns false. */
-static bool estimate_dominant_flow(int frame_num, float &flow_x, float &flow_y,
+static bool estimate_dominant_flow(guint source_id, int frame_num, float &flow_x, float &flow_y,
                                    int &supporting_tracks, float &strength)
 {
     double sum_x = 0.0;
@@ -1412,7 +1533,7 @@ static bool estimate_dominant_flow(int frame_num, float &flow_x, float &flow_y,
     for (const auto &entry : track_states)
     {
         const TrackState &ts = entry.second;
-        if (!ts.motion_valid ||
+        if (ts.source_id != source_id || !ts.motion_valid ||
             frame_num - ts.last_frame > WRONG_ROUTE_MAX_MOTION_AGE ||
             frame_num - ts.motion_last_frame > WRONG_ROUTE_MAX_MOTION_AGE)
             continue;
@@ -1473,7 +1594,7 @@ static void handle_save_result(
     const SaveResult &r,
     int frame_num)
 {
-    auto it = track_states.find(r.track_id);
+    auto it = track_states.find(r.state_key);
     const bool wrong_route = (r.violation_type == "wrong_route");
 
     if (r.success)
@@ -1550,18 +1671,29 @@ static void drain_save_results()
     }
 
     for (const SaveResult &r : done)
-        handle_save_result(r, last_seen_frame_num);
+    {
+        auto frame_it = last_seen_frame_nums.find(r.source_id);
+        handle_save_result(r, frame_it == last_seen_frame_nums.end() ? 0 : frame_it->second);
+    }
 }
 
 
-static void bump_epoch(const char *reason)
+static void bump_epoch(guint source_id, const char *reason)
 {
-    tracker_epoch++;
-    track_states.clear();
-    id_generation.clear();
-
-    std::cout << "[TRACKER] restart detected (" << reason
-              << "), epoch=" << tracker_epoch << std::endl;
+    guint64 &epoch = tracker_epochs[source_id];
+    ++epoch;
+    for (auto it = track_states.begin(); it != track_states.end(); )
+    {
+        if (it->second.source_id == source_id) it = track_states.erase(it);
+        else ++it;
+    }
+    for (auto it = id_generation.begin(); it != id_generation.end(); )
+    {
+        if ((it->first >> 56) == source_id) it = id_generation.erase(it);
+        else ++it;
+    }
+    std::cout << "[TRACKER] camera=" << camera_id_for_source(source_id)
+              << " restart detected (" << reason << "), epoch=" << epoch << std::endl;
 }
 
 
@@ -1600,31 +1732,24 @@ static GstPadProbeReturn infer_src_probe(
         const int frame_num = static_cast<int>(frame_meta->frame_num);
         const guint64 pts = frame_meta->buf_pts;
 
-        /*
-         * Stream / tracker restart -> tracker ids may be reused ->
-         * new epoch. Signals: the camera source was re-linked, the
-         * frame counter went backwards, or the timestamp jumped back.
-         */
-        const gint links = g_atomic_int_get(&source_link_count);
-
-        if (links != source_link_seen)
+        /* Restart tracking is per source; batch frames from different cameras
+         * must never reset one another's history. */
+        const guint source_id = frame_meta->source_id;
+        const int links = (source_id < source_contexts.size())
+            ? g_atomic_int_get(&source_contexts[source_id].link_count) : 0;
+        int &seen_links = source_link_seen_by_source[source_id];
+        if (links != seen_links)
         {
-            if (source_link_seen > 0)
-                bump_epoch("camera source re-linked");
-
-            source_link_seen = links;
+            if (seen_links > 0) bump_epoch(source_id, "camera source re-linked");
+            seen_links = links;
         }
-        else if (last_seen_frame_num >= 0 && frame_num < last_seen_frame_num)
-        {
-            bump_epoch("frame counter went backwards");
-        }
-        else if (last_seen_pts > 0 && pts + GST_SECOND < last_seen_pts)
-        {
-            bump_epoch("timestamp went backwards");
-        }
-
-        last_seen_frame_num = frame_num;
-        last_seen_pts = pts;
+        else if (last_seen_frame_nums.count(source_id) && frame_num < last_seen_frame_nums[source_id])
+            bump_epoch(source_id, "frame counter went backwards");
+        else if (last_seen_pts_by_source.count(source_id) && last_seen_pts_by_source[source_id] > 0 &&
+                 pts + GST_SECOND < last_seen_pts_by_source[source_id])
+            bump_epoch(source_id, "timestamp went backwards");
+        last_seen_frame_nums[source_id] = frame_num;
+        last_seen_pts_by_source[source_id] = pts;
 
         for (NvDsMetaList *l_obj = frame_meta->obj_meta_list;
              l_obj;
@@ -1645,6 +1770,8 @@ static GstPadProbeReturn infer_src_probe(
                 continue;
 
             const guint64 id = obj_meta->object_id;
+            const guint source_id = frame_meta->source_id;
+            const guint64 state_key = make_track_state_key(source_id, id);
 
             /* bottom edge of the bounding box */
             const float y =
@@ -1655,7 +1782,7 @@ static GstPadProbeReturn infer_src_probe(
                 ((y <= line_y - LINE_HYSTERESIS_PX) ? -1 :
                  (y >= line_y + LINE_HYSTERESIS_PX) ?  1 : 0);
 
-            auto it = track_states.find(id);
+            auto it = track_states.find(state_key);
 
             /* same id back after a long gap = tracker reused it */
             if (it != track_states.end() &&
@@ -1668,16 +1795,17 @@ static GstPadProbeReturn infer_src_probe(
             if (it == track_states.end())
             {
                 /* first sighting (of this life of the id) */
-                auto g = id_generation.find(id);
+                auto g = id_generation.find(state_key);
 
                 if (g == id_generation.end())
-                    id_generation[id] = 0;
+                    id_generation[state_key] = 0;
                 else
                     g->second++;
 
                 TrackState ts;
                 ts.last_y = y;
                 ts.last_frame = frame_num;
+                ts.source_id = source_id;
                 ts.side = zone;
                 MotionPoint first_point;
                 first_point.x = obj_meta->rect_params.left + obj_meta->rect_params.width * 0.5f;
@@ -1685,7 +1813,7 @@ static GstPadProbeReturn infer_src_probe(
                 first_point.frame = frame_num;
                 ts.motion_history.push_back(first_point);
 
-                track_states[id] = ts;
+                track_states[state_key] = ts;
                 continue;
             }
 
@@ -1696,10 +1824,11 @@ static GstPadProbeReturn infer_src_probe(
             ts.lost_logged = false;
             ts.wrong_route_lost_logged = false;
 
-            const guint32 gen = id_generation[id];
+            const guint32 gen = id_generation[state_key];
+            const guint64 epoch = tracker_epochs[source_id];
             const CaptureKey key(
-                (tracker_epoch << 20) | (gen & 0xFFFFF),
-                id);
+                (epoch << 20) | (gen & 0xFFFFF),
+                state_key);
 
             /* Update rolling centre-position history and track displacement. */
             MotionPoint point;
@@ -1729,7 +1858,7 @@ static GstPadProbeReturn infer_src_probe(
             float flow_x = 0.0f, flow_y = 0.0f, flow_strength = 0.0f;
             int flow_tracks = 0;
             const bool flow_valid = estimate_dominant_flow(
-                frame_num, flow_x, flow_y, flow_tracks, flow_strength);
+                source_id, frame_num, flow_x, flow_y, flow_tracks, flow_strength);
 
             if (!ts.wrong_route_confirmed && flow_valid && ts.motion_valid &&
                 frame_num - ts.motion_last_frame <= WRONG_ROUTE_MAX_MOTION_AGE)
@@ -1829,13 +1958,15 @@ static GstPadProbeReturn infer_src_probe(
                 bool encoder_related = false;
                 const bool started = start_vehicle_crop(
                     buf, frame_meta, obj_meta, object_name,
-                    obj_meta->confidence, id, tracker_epoch, gen, key,
+                    obj_meta->confidence, id, state_key, epoch, gen, key,
                     "wrong_route", encoder_related);
                 if (!started)
                 {
                     SaveResult r;
                     r.key = key;
                     r.track_id = id;
+                    r.state_key = state_key;
+                    r.source_id = source_id;
                     r.violation_type = "wrong_route";
                     r.success = false;
                     r.encoder_related = encoder_related;
@@ -1862,7 +1993,8 @@ static GstPadProbeReturn infer_src_probe(
                     object_name,
                     obj_meta->confidence,
                     id,
-                    tracker_epoch,
+                    state_key,
+                    epoch,
                     gen,
                     key,
                     "red_light_violation",
@@ -1873,6 +2005,8 @@ static GstPadProbeReturn infer_src_probe(
                     SaveResult r;
                     r.key = key;
                     r.track_id = id;
+                    r.state_key = state_key;
+                    r.source_id = source_id;
                     r.violation_type = "red_light_violation";
                     r.success = false;
                     r.encoder_related = encoder_related;
@@ -1888,6 +2022,7 @@ static GstPadProbeReturn infer_src_probe(
             for (auto &kv : track_states)
             {
                 TrackState &t = kv.second;
+                if (t.source_id != source_id) continue;
 
                 if (t.crossed_waiting &&
                     !t.lost_logged &&
@@ -1918,7 +2053,8 @@ static GstPadProbeReturn infer_src_probe(
             for (auto it = track_states.begin();
                  it != track_states.end();)
             {
-                if (frame_num - it->second.last_frame > 900)
+                if (it->second.source_id == source_id &&
+                    frame_num - it->second.last_frame > 900)
                     it = track_states.erase(it);
                 else
                     ++it;
@@ -2049,8 +2185,8 @@ static void on_pad_added(
     GstPad *new_pad,
     gpointer user_data)
 {
-    GstElement *streammux =
-        GST_ELEMENT(user_data);
+    SourceContext *source_ctx = static_cast<SourceContext *>(user_data);
+    GstElement *streammux = source_ctx->streammux;
 
     GstCaps *caps =
         gst_pad_get_current_caps(new_pad);
@@ -2083,16 +2219,14 @@ static void on_pad_added(
         return;
     }
 
-    GstPad *sink_pad =
-        gst_element_request_pad_simple(
-            streammux,
-            "sink_0");
+    const std::string sink_name = "sink_" + std::to_string(source_ctx->source_id);
+    GstPad *sink_pad = gst_element_request_pad_simple(streammux, sink_name.c_str());
 
     if (!sink_pad)
     {
         std::cerr
             << "ERROR: Cannot get "
-               "nvstreammux sink_0"
+               "nvstreammux requested sink pad"
             << std::endl;
 
         gst_caps_unref(caps);
@@ -2113,10 +2247,10 @@ static void on_pad_added(
 
     if (ret == GST_PAD_LINK_OK)
     {
-        g_atomic_int_inc(&source_link_count);
+        g_atomic_int_inc(&source_ctx->link_count);
 
         std::cout
-            << "Video linked to nvstreammux."
+            << "Camera " << source_ctx->camera_id << " linked to nvstreammux " << sink_name << "."
             << std::endl;
     }
     else
@@ -2318,30 +2452,27 @@ int main(int argc, char *argv[])
                   << crosswalk_config.line_y << std::endl;
     }
 
-    /*
-     * ========================================================
-     * NEW:
-     * Get RTSP URL from cameras.json
-     *
-     * No RTSP URL is accepted from command line anymore.
-     * ========================================================
-     */
-
-    std::string rtsp_url_string =
-        get_rtsp_url_from_json();
-
-    if (rtsp_url_string.empty())
+    std::vector<CameraInput> cameras = get_rtsp_inputs_from_json();
+    if (cameras.empty())
     {
-        std::cerr
-            << "ERROR: No valid RTSP stream available."
-            << std::endl;
-
+        std::cerr << "ERROR: No valid online RTSP streams available in "
+                  << CAMERA_JSON_FILE << std::endl;
         return 1;
     }
-
-    const gchar *rtsp_url =
-        rtsp_url_string.c_str();
-
+    source_contexts.clear();
+    source_camera_ids.clear();
+    source_contexts.reserve(cameras.size());
+    source_camera_ids.reserve(cameras.size());
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        SourceContext ctx;
+        ctx.source_id = static_cast<guint>(i);
+        ctx.camera_id = cameras[i].id;
+        ctx.rtsp_url = cameras[i].url;
+        source_camera_ids.push_back(ctx.camera_id);
+        source_contexts.push_back(ctx);
+        tracker_epochs[static_cast<guint>(i)] = 0;
+    }
 
     gst_init(&argc, &argv);
 
@@ -2401,10 +2532,13 @@ int main(int argc, char *argv[])
 
     /* Core chain */
 
-    GstElement *source =
-        gst_element_factory_make(
-            "nvurisrcbin",
-            "camera-source");
+    std::vector<GstElement *> sources;
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        const std::string name = "camera-source-" + std::to_string(i);
+        GstElement *src = gst_element_factory_make("nvurisrcbin", name.c_str());
+        sources.push_back(src);
+    }
 
     GstElement *streammux =
         gst_element_factory_make(
@@ -2474,19 +2608,19 @@ int main(int argc, char *argv[])
 
     /* Branch C: live RTSP re-stream */
 
-    GstElement *rtsp_queue =
-        gst_element_factory_make(
-            "queue",
-            "rtsp-queue");
-
-    GstElement *rtsp_sink =
-        gst_element_factory_make(
-            "nvrtspoutsinkbin",
-            "rtsp-output");
+    GstElement *rtsp_demux = gst_element_factory_make("nvstreamdemux", "camera-output-demux");
+    std::vector<GstElement *> rtsp_queues;
+    std::vector<GstElement *> rtsp_sinks;
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        const std::string qname = "rtsp-queue-" + std::to_string(i);
+        const std::string sname = "rtsp-output-" + std::to_string(i);
+        rtsp_queues.push_back(gst_element_factory_make("queue", qname.c_str()));
+        rtsp_sinks.push_back(gst_element_factory_make("nvrtspoutsinkbin", sname.c_str()));
+    }
 
 
     if (!pipeline ||
-        !source ||
         !streammux ||
         !infer ||
         !tracker ||
@@ -2499,12 +2633,10 @@ int main(int argc, char *argv[])
         !snapshot_capsfilter ||
         !jpegenc ||
         !appsink_element ||
-        !rtsp_queue ||
-        !rtsp_sink)
+        !rtsp_demux)
     {
         std::cerr
-            << "ERROR: Failed to create one or more "
-               "GStreamer/DeepStream elements."
+            << "ERROR: Failed to create one or more GStreamer/DeepStream elements."
             << std::endl;
 
         if (pipeline)
@@ -2514,23 +2646,32 @@ int main(int argc, char *argv[])
 
         return 1;
     }
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        if (!sources[i] || !rtsp_queues[i] || !rtsp_sinks[i])
+        {
+            std::cerr << "ERROR: Failed to create camera source/output for index " << i << std::endl;
+            gst_object_unref(pipeline);
+            g_main_loop_unref(main_loop);
+            return 1;
+        }
+    }
 
 
     /* --- Properties --- */
 
-    g_object_set(
-        G_OBJECT(source),
-        "uri",
-        rtsp_url,
-        "latency",
-        200,
-        nullptr);
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        g_object_set(G_OBJECT(sources[i]), "uri", cameras[i].url.c_str(),
+                     "latency", 200, nullptr);
+        source_contexts[i].streammux = streammux;
+    }
 
 
     g_object_set(
         G_OBJECT(streammux),
         "batch-size",
-        1,
+        static_cast<guint>(INFER_BATCH_SIZE),
         "width",
         1920,
         "height",
@@ -2546,6 +2687,7 @@ int main(int argc, char *argv[])
         G_OBJECT(infer),
         "config-file-path",
         DEEPSTREAM_CONFIG,
+        "batch-size", static_cast<guint>(INFER_BATCH_SIZE),
         nullptr);
 
 
@@ -2614,13 +2756,16 @@ int main(int argc, char *argv[])
     gst_caps_unref(snapshot_caps);
 
 
-    g_object_set(
-        G_OBJECT(rtsp_sink),
-        "idrinterval",
-        30,
-        "iframeinterval",
-        30,
-        nullptr);
+    for (size_t i = 0; i < rtsp_sinks.size(); ++i)
+    {
+        const std::string mount = (i == 0) ? "/ai" : "/ai" + std::to_string(i + 1);
+        g_object_set(G_OBJECT(rtsp_sinks[i]),
+                     "idrinterval", 30,
+                     "iframeinterval", 30,
+                     "rtsp-port", static_cast<guint>(RTSP_OUTPUT_BASE_PORT + i),
+                     "rtsp-mount-point", mount.c_str(),
+                     nullptr);
+    }
 
 
     /* --- Add everything to pipeline --- */
@@ -2628,7 +2773,6 @@ int main(int argc, char *argv[])
     gst_bin_add_many(
         GST_BIN(pipeline),
 
-        source,
         streammux,
         infer,
         tracker,
@@ -2644,10 +2788,11 @@ int main(int argc, char *argv[])
         jpegenc,
         appsink_element,
 
-        rtsp_queue,
-        rtsp_sink,
-
+        rtsp_demux,
         nullptr);
+    for (GstElement *src : sources) gst_bin_add(GST_BIN(pipeline), src);
+    for (GstElement *q : rtsp_queues) gst_bin_add(GST_BIN(pipeline), q);
+    for (GstElement *sink : rtsp_sinks) gst_bin_add(GST_BIN(pipeline), sink);
 
 
     /* --- Static links --- */
@@ -2710,52 +2855,44 @@ int main(int argc, char *argv[])
     }
 
 
-    /* rtsp_queue -> nvrtspoutsinkbin */
-
+    /* One independent demux output and RTSP server per camera. */
+    for (size_t i = 0; i < cameras.size(); ++i)
     {
-        GstPad *rtsp_sink_pad =
-            gst_element_request_pad_simple(
-                rtsp_sink,
-                "vsink");
-
-        GstPad *queue_src_pad =
-            gst_element_get_static_pad(
-                rtsp_queue,
-                "src");
-
-        if (!rtsp_sink_pad ||
-            !queue_src_pad ||
-            gst_pad_link(
-                queue_src_pad,
-                rtsp_sink_pad)
-                != GST_PAD_LINK_OK)
+        const std::string demux_pad_name = "src_" + std::to_string(i);
+        GstPad *demux_src = gst_element_request_pad_simple(rtsp_demux, demux_pad_name.c_str());
+        GstPad *queue_sink = gst_element_get_static_pad(rtsp_queues[i], "sink");
+        GstPad *queue_src = gst_element_get_static_pad(rtsp_queues[i], "src");
+        GstPad *rtsp_video_sink = gst_element_request_pad_simple(rtsp_sinks[i], "vsink");
+        const bool first_link_ok = demux_src && queue_sink &&
+            gst_pad_link(demux_src, queue_sink) == GST_PAD_LINK_OK;
+        const bool second_link_ok = queue_src && rtsp_video_sink &&
+            gst_pad_link(queue_src, rtsp_video_sink) == GST_PAD_LINK_OK;
+        if (!first_link_ok || !second_link_ok)
         {
-            std::cerr
-                << "ERROR: Failed to link "
-                   "rtsp-queue -> "
-                   "nvrtspoutsinkbin."
-                << std::endl;
-
-            if (rtsp_sink_pad)
-                gst_object_unref(
-                    rtsp_sink_pad);
-
-            if (queue_src_pad)
-                gst_object_unref(
-                    queue_src_pad);
-
+            std::cerr << "ERROR: Failed to link demux/RTSP output for camera " << cameras[i].id << std::endl;
+            if (demux_src) gst_object_unref(demux_src);
+            if (queue_sink) gst_object_unref(queue_sink);
+            if (queue_src) gst_object_unref(queue_src);
+            if (rtsp_video_sink) gst_object_unref(rtsp_video_sink);
             gst_object_unref(pipeline);
             g_main_loop_unref(main_loop);
-
             return 1;
         }
-
-        gst_object_unref(rtsp_sink_pad);
-        gst_object_unref(queue_src_pad);
+        gst_object_unref(demux_src);
+        gst_object_unref(queue_sink);
+        gst_object_unref(queue_src);
+        gst_object_unref(rtsp_video_sink);
+    }
+    if (!gst_element_link(tee, rtsp_demux))
+    {
+        std::cerr << "ERROR: Failed to link tee -> nvstreamdemux." << std::endl;
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+        return 1;
     }
 
 
-    /* --- Tee: request 3 src pads --- */
+    /* --- Tee: detection, snapshot and per-camera RTSP demux branches --- */
 
     if (!link_tee_branch(
             tee,
@@ -2765,12 +2902,7 @@ int main(int argc, char *argv[])
         !link_tee_branch(
             tee,
             snapshot_queue,
-            "snapshot queue") ||
-
-        !link_tee_branch(
-            tee,
-            rtsp_queue,
-            "rtsp queue"))
+            "snapshot queue"))
     {
         gst_object_unref(pipeline);
         g_main_loop_unref(main_loop);
@@ -2781,11 +2913,8 @@ int main(int argc, char *argv[])
 
     /* --- Dynamic source pad --- */
 
-    g_signal_connect(
-        source,
-        "pad-added",
-        G_CALLBACK(on_pad_added),
-        streammux);
+    for (size_t i = 0; i < sources.size(); ++i)
+        g_signal_connect(sources[i], "pad-added", G_CALLBACK(on_pad_added), &source_contexts[i]);
 
 
     /* --- Fixed Crosswalk line probe --- */
@@ -2886,13 +3015,16 @@ int main(int argc, char *argv[])
         " CAMERA JSON: %s\n",
         CAMERA_JSON_FILE);
 
-    g_print(
-        " RTSP INPUT:  %s\n",
-        rtsp_url);
-
-    g_print(
-        " RTSP OUTPUT: %s\n",
-        RTSP_OUTPUT_URL_HINT);
+    g_print(" RTSP INPUT CAMERAS: %zu\n", cameras.size());
+    for (size_t i = 0; i < cameras.size(); ++i)
+        g_print("  INPUT %s: %s\n", cameras[i].id.c_str(), cameras[i].url.c_str());
+    g_print(" AI OUTPUT LINKS:\n");
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        const std::string mount = (i == 0) ? "/ai" : "/ai" + std::to_string(i + 1);
+        g_print("  %s: rtsp://%s:%u%s\n", cameras[i].id.c_str(), RTSP_OUTPUT_HOST_HINT,
+                static_cast<unsigned>(RTSP_OUTPUT_BASE_PORT + i), mount.c_str());
+    }
 
     g_print(
         " DeepStream config: %s\n",
